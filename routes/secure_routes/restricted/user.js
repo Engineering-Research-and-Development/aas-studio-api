@@ -9,9 +9,7 @@ router.post('/insert', [
     check('name').isAlpha('it-IT', { ignore: " " }).trim(),
     check('surname').isAlpha('it-IT', { ignore: " '’" }).trim(),
     check('number').isMobilePhone('it-IT', { strictMode: false }).trim(),
-    check('email').isEmail().normalizeEmail({ gmail_remove_dots: false }).trim(),
-    check('gender').optional().isAlpha('it-IT').isLength({ min: 1, max: 1 }).trim(),
-    check('position').optional().isAlpha('it-IT').isLength({ min: 1, max: 1 }).trim()
+    check('email').isEmail().normalizeEmail({ gmail_remove_dots: false }).trim()
 ], (req, res) => {
     var err = validationResult(req);
     if (!err.isEmpty()) {
@@ -29,9 +27,7 @@ router.post('/update', [
     check('name').isAlpha('it-IT', { ignore: " " }).trim(),
     check('surname').isAlpha('it-IT', { ignore: " '’" }).trim(),
     check('number').isMobilePhone('it-IT', { strictMode: false }).trim(),
-    check('email').isEmail().normalizeEmail({ gmail_remove_dots: false }).trim(),
-    check('gender').optional().isAlpha('it-IT').isLength({ min: 1, max: 1 }).trim(),
-    check('position').optional().isAlpha('it-IT').isLength({ min: 1, max: 1 }).trim()
+    check('email').isEmail().normalizeEmail({ gmail_remove_dots: false }).trim()
 ], (req, res) => {
     var err = validationResult(req);
     if (!err.isEmpty()) {
