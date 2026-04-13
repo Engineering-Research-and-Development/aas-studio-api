@@ -26,7 +26,7 @@ const jwtStrategy = new JWTStrategy(
                         model: models.Operator, as: "Operator",
                         include: [
                             {
-                                model: models.Organization, as: "Organization",
+                                model: models.Organization, as: "organization",
                                 attributes: ["organization_id", "name", "email", "number", "picture", "is_activated"],
                                 where: {
                                     organization_id: token.operator.organization_id
@@ -78,7 +78,7 @@ const loginStrategy = new LocalStrategy(
                         model: models.Operator, as: "Operator",
                         include: [
                             {
-                                model: models.Organization, as: "Organization",
+                                model: models.Organization, as: "organization",
                                 attributes: ["organization_id", "name", "email", "number", "picture", "is_activated"],
                                 required: true
                             },

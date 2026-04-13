@@ -1,32 +1,27 @@
 const express = require('express');
 const router = express.Router();
-const moment = require('moment');
 
 const unrestrictedRoutes = require("./unrestricted");
 const restrictedRoutes = require("./restricted");
 
 router.use(unrestrictedRoutes);
 
+// Guard: operator and organization must be active
 router.use((req, res, next) => {
     const is_activated = req.user.is_activated;
     const is_organization_activated = req.user.is_organization_activated;
-  
-    if (!is_activated == "activated") {
+
+    if (is_activated !== "activated") {
         return res.status(402).json({
             status: "Failure",
-            message: "Operator is no longer active"
+            message: "Il tuo account non è più attivo"
         });
     }
-    if (!is_organization_activated == "activated") {
+
+    if (is_organization_activated !== "activated") {
         return res.status(402).json({
             status: "Failure",
-            message: "Organization is no longer active"
-        });
-    }
-    if (moment().isAfter(expirationLimit)) {
-        return res.status(402).json({
-            status: "Failure",
-            message: "Subscription has expired. Please contact support."
+            message: "L'organizzazione non è più attiva"
         });
     }
 

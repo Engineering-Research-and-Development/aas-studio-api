@@ -63,8 +63,7 @@ router.post('/login', [
                         type: user.Operator.type,
                         is_activated: user.Operator.is_activated,
                         is_organization_activated: user.Operator.organization.is_activated,
-                        expiration: user.Operator.organization.expiration,
-                        session_id: session_id 
+                        session_id: session_id
                     };
 
                     const accessToken = jwt.sign({ operator: payload },
@@ -99,6 +98,10 @@ router.post('/login', [
                             organization_id: payload.organization_id,
                             session_id: session_id,
                             auth_token: accessToken,
+                            name: user.name,
+                            surname: user.surname,
+                            email: user.email,
+                            picture: user.picture || null,
                             user: {
                                 user_id: user.user_id,
                                 name: user.name,
