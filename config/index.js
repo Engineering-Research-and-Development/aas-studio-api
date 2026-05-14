@@ -16,5 +16,8 @@ module.exports = {
   jwt: {
     auth_secret: process.env.JWT_AUTH_SECRET || "SECRET_TOKEN",
     refresh_secret: process.env.JWT_REFRESH_SECRET || "SECRET_TOKEN",
+  },
+  github: {
+    token: process.env.GITHUB_TOKEN || undefined,
   }
 };
