@@ -192,7 +192,7 @@ VALUES
    'urn:aas-studio:demo:pump-cp200',
    'urn:asset:demo:centrifugal-pump-cp200',
    'Instance',
-   'Pompa centrifuga CP200 — documento AAS di test',
+   'Pompa centrifuga CP200 - documento AAS di test',
    1, 1)
 ON DUPLICATE KEY UPDATE `id_short` = VALUES(`id_short`);
 
