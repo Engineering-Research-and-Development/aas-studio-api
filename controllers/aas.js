@@ -70,14 +70,17 @@ function nextRevision(rev) {
  * Upsert a snapshot: if the hash already exists (same content) reuse it.
  * Returns the AASSnapshot instance.
  */
-async function upsertSnapshot(content, transaction) {
+// NOTE: intentionally NO transaction parameter.
+// InnoDB FK checks read *committed* data only. If snapshot and commit are in the same
+// transaction, the FK check on AASCommit cannot see the uncommitted AASSnapshot row and
+// raises error 1452. By committing the snapshot first (auto-commit), the row is visible
+// to the FK check when AASCommit is inserted inside the main transaction.
+async function upsertSnapshot(content) {
   const { hash } = normalizeAndHash(content);
-  const [snapshot] = await models.AASSnapshot.findOrCreate({
-    where: { hash },
-    defaults: { hash, content },
-    transaction
-  });
-  return snapshot;
+  await models.AASSnapshot.upsert({ hash, content });
+  const snap = await models.AASSnapshot.findOne({ where: { hash } });
+  if (!snap) throw new Error(`Snapshot non trovato dopo upsert (hash=${hash})`);
+  return snap;
 }
 
 /**
@@ -204,61 +207,63 @@ exports.listDocuments = async (req, res) => {
  *   diffs         array    optional  (initial diff entries)
  */
 exports.createDocument = async (req, res) => {
-  const t = await dbConnection.sequelize.transaction();
+  const { organization_id, operator_id } = req.user;
+  const {
+    id_short, aas_id, asset_id,
+    asset_kind = "Instance", description,
+    version = "1.0.0", revision = "A",
+    message = "Initial commit",
+    content = null, diffs = []
+  } = req.body;
+
+  if (!id_short || !aas_id || !asset_id) {
+    return res.status(400).json({ status: "Failure", message: "id_short, aas_id e asset_id sono obbligatori" });
+  }
+
   try {
-    const { organization_id, operator_id } = req.user;
-    const {
-      id_short, aas_id, asset_id,
-      asset_kind = "Instance", description,
-      version = "1.0.0", revision = "A",
-      message = "Initial commit",
-      content = null, diffs = []
-    } = req.body;
-
-    if (!id_short || !aas_id || !asset_id) {
-      await t.rollback();
-      return res.status(400).json({ status: "Failure", message: "id_short, aas_id e asset_id sono obbligatori" });
-    }
-
-    const document = await models.AASDocument.create(
-      { id_short, aas_id, asset_id, asset_kind, description, organization_id, created_by: operator_id },
-      { transaction: t }
-    );
-
-    // Content-addressable snapshot
+    // Commit snapshot before transaction (InnoDB FK check requires committed rows).
     let snapshot_hash = null;
     if (content) {
-      const snap = await upsertSnapshot(content, t);
+      const snap = await upsertSnapshot(content);
       snapshot_hash = snap.hash;
     }
 
     const commit_hash = shortHash(`${aas_id}:${version}:${revision}:${Date.now()}`);
 
-    const commit = await models.AASCommit.create(
-      { document_id: document.document_id, commit_hash, version, revision, status: "Draft", message, author_id: operator_id, parent_commit_id: null, snapshot_hash },
-      { transaction: t }
-    );
-
-    if (Array.isArray(diffs) && diffs.length > 0) {
-      await models.AASCommitDiff.bulkCreate(
-        diffs.map((d, idx) => ({ commit_id: commit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description || null, sort_order: d.sort_order ?? idx })),
+    const t = await dbConnection.sequelize.transaction();
+    try {
+      const document = await models.AASDocument.create(
+        { id_short, aas_id, asset_id, asset_kind, description, organization_id, created_by: operator_id },
         { transaction: t }
       );
+
+      const commit = await models.AASCommit.create(
+        { document_id: document.document_id, commit_hash, version, revision, status: "Draft", message, author_id: operator_id, parent_commit_id: null, snapshot_hash },
+        { transaction: t }
+      );
+
+      if (Array.isArray(diffs) && diffs.length > 0) {
+        await models.AASCommitDiff.bulkCreate(
+          diffs.map((d, idx) => ({ commit_id: commit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description || null, sort_order: d.sort_order ?? idx })),
+          { transaction: t }
+        );
+      }
+
+      await setRef(document.document_id, "HEAD", commit.commit_id, t);
+      await setRef(document.document_id, "main", commit.commit_id, t);
+
+      await t.commit();
+
+      return res.status(201).json({
+        status: "Success",
+        message: "Documento AAS creato con successo",
+        data: { document: document.toJSON(), commit: commit.toJSON(), refs: ["HEAD", "main"] },
+      });
+    } catch (err) {
+      await t.rollback();
+      throw err;
     }
-
-    // Create HEAD and main refs pointing to the initial commit
-    await setRef(document.document_id, "HEAD", commit.commit_id, t);
-    await setRef(document.document_id, "main", commit.commit_id, t);
-
-    await t.commit();
-
-    return res.status(201).json({
-      status: "Success",
-      message: "Documento AAS creato con successo",
-      data: { document: document.toJSON(), commit: commit.toJSON(), refs: ["HEAD", "main"] }
-    });
   } catch (err) {
-    await t.rollback();
     loggerService.printRequestError(path.basename(__filename), "createDocument", req.user, req.body, err.message);
     return res.status(500).json({ status: "Failure", message: err.message });
   }
@@ -460,31 +465,34 @@ exports.checkout = async (req, res) => {
  *   ref        string   default 'HEAD'  (which ref to advance after commit)
  */
 exports.commit = async (req, res) => {
-  const t = await dbConnection.sequelize.transaction();
+  const { organization_id, operator_id } = req.user;
+  const { document_id } = req.params;
+  const {
+    message, content, diffs = [],
+    version: reqVersion, revision: reqRevision,
+    status = "Draft", ref = "HEAD"
+  } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ status: "Failure", message: "Il campo 'message' è obbligatorio" });
+  }
+
   try {
-    const { organization_id, operator_id } = req.user;
-    const { document_id } = req.params;
-    const {
-      message, content, diffs = [],
-      version: reqVersion, revision: reqRevision,
-      status = "Draft", ref = "HEAD"
-    } = req.body;
-
-    if (!message) {
-      await t.rollback();
-      return res.status(400).json({ status: "Failure", message: "Il campo 'message' è obbligatorio" });
-    }
-
     const document = await findDocumentForOrg(document_id, organization_id);
     if (!document) {
-      await t.rollback();
       return res.status(404).json({ status: "Failure", message: "Documento non trovato" });
     }
 
-    // Resolve current HEAD as parent
+    // InnoDB FK checks read committed data only, so the snapshot must be committed
+    // BEFORE the main transaction that inserts AASCommit starts.
+    let snapshot_hash = null;
+    if (content) {
+      const snap = await upsertSnapshot(content);
+      snapshot_hash = snap.hash;
+    }
+
     const parentCommit = await resolveRef(document.document_id, ref);
 
-    // Compute version / revision
     let version, revision;
     if (reqVersion) {
       version = reqVersion;
@@ -497,55 +505,49 @@ exports.commit = async (req, res) => {
       revision = "A";
     }
 
-    // Content-addressable snapshot
-    let snapshot_hash = null;
-    if (content) {
-      const snap = await upsertSnapshot(content, t);
-      snapshot_hash = snap.hash;
-
-      // If same snapshot as parent, still allow the commit (message/metadata differ)
-    }
-
     const commit_hash = shortHash(`${document_id}:${version}:${revision}:${message}:${Date.now()}`);
 
-    const newCommit = await models.AASCommit.create(
-      {
-        document_id: document.document_id,
-        commit_hash,
-        version,
-        revision,
-        status,
-        message,
-        author_id: operator_id,
-        parent_commit_id: parentCommit ? parentCommit.commit_id : null,
-        snapshot_hash
-      },
-      { transaction: t }
-    );
-
-    if (Array.isArray(diffs) && diffs.length > 0) {
-      await models.AASCommitDiff.bulkCreate(
-        diffs.map((d, idx) => ({ commit_id: newCommit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description || null, sort_order: d.sort_order ?? idx })),
+    const t = await dbConnection.sequelize.transaction();
+    try {
+      const newCommit = await models.AASCommit.create(
+        {
+          document_id: document.document_id,
+          commit_hash, version, revision, status, message,
+          author_id: operator_id,
+          parent_commit_id: parentCommit ? parentCommit.commit_id : null,
+          snapshot_hash,
+        },
         { transaction: t }
       );
+
+      if (Array.isArray(diffs) && diffs.length > 0) {
+        await models.AASCommitDiff.bulkCreate(
+          diffs.map((d, idx) => ({
+            commit_id: newCommit.commit_id,
+            change_type: d.change_type, target: d.target, name: d.name,
+            description: d.description || null, sort_order: d.sort_order ?? idx,
+          })),
+          { transaction: t }
+        );
+      }
+
+      await setRef(document.document_id, ref, newCommit.commit_id, t);
+      if (ref !== "HEAD") {
+        await setRef(document.document_id, "HEAD", newCommit.commit_id, t);
+      }
+
+      await t.commit();
+
+      return res.status(201).json({
+        status: "Success",
+        message: "Commit creato con successo",
+        data: { commit: newCommit.toJSON(), snapshot_hash, ref_advanced: ref },
+      });
+    } catch (err) {
+      await t.rollback();
+      throw err;
     }
-
-    // Advance the ref to the new commit
-    await setRef(document.document_id, ref, newCommit.commit_id, t);
-    // Also keep HEAD in sync when committing on a non-HEAD ref
-    if (ref !== "HEAD") {
-      await setRef(document.document_id, "HEAD", newCommit.commit_id, t);
-    }
-
-    await t.commit();
-
-    return res.status(201).json({
-      status: "Success",
-      message: "Commit creato con successo",
-      data: { commit: newCommit.toJSON(), snapshot_hash, ref_advanced: ref }
-    });
   } catch (err) {
-    await t.rollback();
     loggerService.printRequestError(path.basename(__filename), "commit", req.user, req.body, err.message);
     return res.status(500).json({ status: "Failure", message: err.message });
   }

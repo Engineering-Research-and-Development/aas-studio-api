@@ -42,8 +42,8 @@ router.get("/:document_id/diff/:commit_id_a/:commit_id_b", aas.diff);
 // POST   /aas/:document_id/restore/:commit_id               → git revert (new commit with old snapshot)
 router.post("/:document_id/restore/:commit_id", aas.restore);
 
-// PATCH  /aas/:document_id/commits/:commit_id/status        → change lifecycle status
-router.patch("/:document_id/commits/:commit_id/status", aas.setCommitStatus);
+// PUT    /aas/:document_id/commits/:commit_id/status        → change lifecycle status
+router.put("/:document_id/commits/:commit_id/status", aas.setCommitStatus);
 
 // ---------------------------------------------------------------------------
 // Refs / Branches — git branch / git switch

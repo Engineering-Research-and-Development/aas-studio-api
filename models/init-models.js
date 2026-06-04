@@ -31,9 +31,13 @@ function initModels(sequelize) {
   AASDocument.belongsTo(Operator, { as: "creator", foreignKey: "created_by" });
   Operator.hasMany(AASDocument, { as: "AASDocuments", foreignKey: "created_by" });
 
-  // --- AASSnapshot (content-addressable, no FK constraint needed — hash is the key) ---
-  AASCommit.belongsTo(AASSnapshot, { as: "snapshot", foreignKey: "snapshot_hash", targetKey: "hash" });
-  AASSnapshot.hasMany(AASCommit, { as: "commits", foreignKey: "snapshot_hash", sourceKey: "hash" });
+  // --- AASSnapshot (content-addressable) ---
+  // constraints: false → Sequelize must NOT create a DB-level FK here.
+  // InnoDB FK checks run against committed data only; since we always upsert the
+  // snapshot BEFORE opening the commit transaction, the app already guarantees
+  // referential integrity without a DB constraint.
+  AASCommit.belongsTo(AASSnapshot, { as: "snapshot", foreignKey: "snapshot_hash", targetKey: "hash", constraints: false });
+  AASSnapshot.hasMany(AASCommit, { as: "commits", foreignKey: "snapshot_hash", sourceKey: "hash", constraints: false });
 
   // --- AASCommit ---
   AASCommit.belongsTo(AASDocument, { as: "document", foreignKey: "document_id" });
