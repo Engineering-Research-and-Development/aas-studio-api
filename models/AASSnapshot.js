@@ -8,8 +8,9 @@ const Sequelize = require('sequelize');
  *
  * Hash is computed as:
  *   crypto.createHash('sha256')
- *     .update(JSON.stringify(content, Object.keys(content).sort()))
+ *     .update(JSON.stringify(content, sortKeysReplacer))   // sortKeysReplacer sorts keys recursively
  *     .digest('hex')
+ * See normalizeAndHash() in controllers/aas.js for the canonical implementation.
  */
 module.exports = function(sequelize, DataTypes) {
   return sequelize.define('AASSnapshot', {

@@ -87,15 +87,19 @@ async function upsertSnapshot(content) {
  * Resolve the commit that HEAD (or a named ref) points to for a document.
  * Returns null if the ref doesn't exist yet.
  */
-async function resolveRef(document_id, ref_name = "HEAD") {
-  const ref = await models.AASRef.findOne({
+async function resolveRef(document_id, ref_name = "HEAD", transaction = null, lock = false) {
+  const refOpts = {
     where: {
       document_id: { [Op.eq]: document_id },
       ref_name: { [Op.eq]: ref_name }
     }
-  });
+  };
+  if (transaction) { refOpts.transaction = transaction; if (lock) refOpts.lock = true; }
+  const ref = await models.AASRef.findOne(refOpts);
   if (!ref || !ref.commit_id) return null;
-  return models.AASCommit.findOne({ where: { commit_id: { [Op.eq]: ref.commit_id } } });
+  const commitOpts = { where: { commit_id: { [Op.eq]: ref.commit_id } } };
+  if (transaction) { commitOpts.transaction = transaction; if (lock) commitOpts.lock = true; }
+  return models.AASCommit.findOne(commitOpts);
 }
 
 /**
@@ -351,13 +355,22 @@ exports.log = async (req, res) => {
     if (ref) {
       const tip = await resolveRef(document.document_id, ref);
       if (!tip) return res.status(404).json({ status: "Failure", message: `Ref '${ref}' non trovato` });
-      // Walk the parent chain to collect commit IDs reachable from this ref
+      // Load all commits for this document in one query, then walk the parent chain in memory.
+      // This is O(1) queries instead of O(n) sequential queries and guards against cycles.
+      const allForDoc = await models.AASCommit.findAll({
+        where: { document_id: { [Op.eq]: document.document_id } },
+        attributes: ["commit_id", "parent_commit_id"],
+      });
+      const commitMap = new Map(allForDoc.map(c => [c.commit_id, c]));
       const ids = [];
+      const visited = new Set();
       let cur = tip;
       while (cur) {
+        if (visited.has(cur.commit_id)) break;
+        visited.add(cur.commit_id);
         ids.push(cur.commit_id);
         if (!cur.parent_commit_id) break;
-        cur = await models.AASCommit.findOne({ where: { commit_id: cur.parent_commit_id } });
+        cur = commitMap.get(cur.parent_commit_id) || null;
       }
       where.commit_id = { [Op.in]: ids };
     }
@@ -491,24 +504,28 @@ exports.commit = async (req, res) => {
       snapshot_hash = snap.hash;
     }
 
-    const parentCommit = await resolveRef(document.document_id, ref);
-
-    let version, revision;
-    if (reqVersion) {
-      version = reqVersion;
-      revision = reqRevision || "A";
-    } else if (parentCommit) {
-      version = bumpVersion(parentCommit.version);
-      revision = "A";
-    } else {
-      version = "1.0.0";
-      revision = "A";
-    }
-
-    const commit_hash = shortHash(`${document_id}:${version}:${revision}:${message}:${Date.now()}`);
-
     const t = await dbConnection.sequelize.transaction();
     try {
+      // Lock the ref row so concurrent commits cannot read the same parent and fork history.
+      const parentCommit = await resolveRef(document.document_id, ref, t, true);
+
+      let version, revision;
+      if (reqVersion) {
+        version = reqVersion;
+        revision = reqRevision || "A";
+      } else if (reqRevision) {
+        version = parentCommit ? parentCommit.version : "1.0.0";
+        revision = reqRevision;
+      } else if (parentCommit) {
+        version = bumpVersion(parentCommit.version);
+        revision = "A";
+      } else {
+        version = "1.0.0";
+        revision = "A";
+      }
+
+      const commit_hash = shortHash(`${document_id}:${version}:${revision}:${message}:${Date.now()}`);
+
       const newCommit = await models.AASCommit.create(
         {
           document_id: document.document_id,
@@ -633,7 +650,7 @@ function computeJsonDiff(objA, objB, prefix = "") {
     const fullKey = prefix ? `${prefix}.${k}` : k;
     if (!keysA.has(k)) {
       added.push({ path: fullKey, value: objB[k] });
-    } else if (typeof objA[k] === "object" && typeof objB[k] === "object" && !Array.isArray(objA[k]) && !Array.isArray(objB[k])) {
+    } else if (objA[k] !== null && objB[k] !== null && typeof objA[k] === "object" && typeof objB[k] === "object" && !Array.isArray(objA[k]) && !Array.isArray(objB[k])) {
       const nested = computeJsonDiff(objA[k], objB[k], fullKey);
       added.push(...nested.added);
       removed.push(...nested.removed);
@@ -658,17 +675,13 @@ function computeJsonDiff(objA, objB, prefix = "") {
  * Create a new commit whose content equals the target commit's snapshot (git revert).
  */
 exports.restore = async (req, res) => {
-  const t = await dbConnection.sequelize.transaction();
   try {
     const { organization_id, operator_id } = req.user;
     const { document_id, commit_id } = req.params;
     const { message: reqMessage, status = "Draft" } = req.body;
 
     const document = await findDocumentForOrg(document_id, organization_id);
-    if (!document) {
-      await t.rollback();
-      return res.status(404).json({ status: "Failure", message: "Documento non trovato" });
-    }
+    if (!document) return res.status(404).json({ status: "Failure", message: "Documento non trovato" });
 
     const targetCommit = await models.AASCommit.findOne({
       where: { commit_id: { [Op.eq]: commit_id }, document_id: { [Op.eq]: document.document_id } },
@@ -677,63 +690,64 @@ exports.restore = async (req, res) => {
         { model: models.AASCommitDiff, as: "diffs", required: false }
       ]
     });
-    if (!targetCommit) {
-      await t.rollback();
-      return res.status(404).json({ status: "Failure", message: "Commit di destinazione non trovato" });
-    }
+    if (!targetCommit) return res.status(404).json({ status: "Failure", message: "Commit di destinazione non trovato" });
 
-    const headCommit = await resolveRef(document.document_id, "HEAD");
-    const newVersion = headCommit ? bumpVersion(headCommit.version) : "1.0.0";
-    const message = reqMessage || `Restore to ${targetCommit.commit_hash} (v${targetCommit.version} rev ${targetCommit.revision})`;
+    const t = await dbConnection.sequelize.transaction();
+    try {
+      // Lock HEAD to prevent concurrent commits/restores from forking history.
+      const headCommit = await resolveRef(document.document_id, "HEAD", t, true);
+      const newVersion = headCommit ? bumpVersion(headCommit.version) : "1.0.0";
+      const message = reqMessage || `Restore to ${targetCommit.commit_hash} (v${targetCommit.version} rev ${targetCommit.revision})`;
 
-    const commit_hash = shortHash(`restore:${document_id}:${targetCommit.commit_id}:${Date.now()}`);
+      const commit_hash = shortHash(`restore:${document_id}:${targetCommit.commit_id}:${Date.now()}`);
 
-    const restoreCommit = await models.AASCommit.create(
-      {
-        document_id: document.document_id,
-        commit_hash,
-        version: newVersion,
-        revision: "A",
-        status,
-        message,
-        author_id: operator_id,
-        parent_commit_id: headCommit ? headCommit.commit_id : null,
-        snapshot_hash: targetCommit.snapshot_hash  // reuse the same snapshot blob
-      },
-      { transaction: t }
-    );
-
-    // Clone diff entries from target for reference
-    if (targetCommit.diffs?.length > 0) {
-      await models.AASCommitDiff.bulkCreate(
-        targetCommit.diffs.map((d, idx) => ({ commit_id: restoreCommit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description, sort_order: idx })),
+      const restoreCommit = await models.AASCommit.create(
+        {
+          document_id: document.document_id,
+          commit_hash,
+          version: newVersion,
+          revision: "A",
+          status,
+          message,
+          author_id: operator_id,
+          parent_commit_id: headCommit ? headCommit.commit_id : null,
+          snapshot_hash: targetCommit.snapshot_hash
+        },
         { transaction: t }
       );
+
+      if (targetCommit.diffs?.length > 0) {
+        await models.AASCommitDiff.bulkCreate(
+          targetCommit.diffs.map((d, idx) => ({ commit_id: restoreCommit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description, sort_order: idx })),
+          { transaction: t }
+        );
+      }
+
+      await setRef(document.document_id, "HEAD", restoreCommit.commit_id, t);
+
+      await t.commit();
+
+      return res.status(201).json({
+        status: "Success",
+        message: `Restore completato: nuovo commit ${restoreCommit.commit_hash}`,
+        data: { commit: restoreCommit.toJSON(), restored_from: targetCommit.commit_hash }
+      });
+    } catch (err) {
+      await t.rollback();
+      throw err;
     }
-
-    await setRef(document.document_id, "HEAD", restoreCommit.commit_id, t);
-
-    await t.commit();
-
-    return res.status(201).json({
-      status: "Success",
-      message: `Restore completato: nuovo commit ${restoreCommit.commit_hash}`,
-      data: { commit: restoreCommit.toJSON(), restored_from: targetCommit.commit_hash }
-    });
   } catch (err) {
-    await t.rollback();
     loggerService.printRequestError(path.basename(__filename), "restore", req.user, req.params, err.message);
     return res.status(500).json({ status: "Failure", message: err.message });
   }
 };
 
 /**
- * PATCH /aas/:document_id/commits/:commit_id/status
+ * PUT /aas/:document_id/commits/:commit_id/status
  * Promote / demote a commit status.
  * Promoting to 'Active' auto-deprecates any other Active commit.
  */
 exports.setCommitStatus = async (req, res) => {
-  const t = await dbConnection.sequelize.transaction();
   try {
     const { organization_id } = req.user;
     const { document_id, commit_id } = req.params;
@@ -741,34 +755,38 @@ exports.setCommitStatus = async (req, res) => {
 
     const VALID = ["Draft", "Active", "Deprecated"];
     if (!status || !VALID.includes(status)) {
-      await t.rollback();
       return res.status(400).json({ status: "Failure", message: `'status' deve essere uno tra: ${VALID.join(", ")}` });
     }
 
     const document = await findDocumentForOrg(document_id, organization_id);
-    if (!document) { await t.rollback(); return res.status(404).json({ status: "Failure", message: "Documento non trovato" }); }
+    if (!document) return res.status(404).json({ status: "Failure", message: "Documento non trovato" });
 
     const commit = await models.AASCommit.findOne({ where: { commit_id: { [Op.eq]: commit_id }, document_id: { [Op.eq]: document.document_id } } });
-    if (!commit) { await t.rollback(); return res.status(404).json({ status: "Failure", message: "Commit non trovato" }); }
+    if (!commit) return res.status(404).json({ status: "Failure", message: "Commit non trovato" });
 
-    if (status === "Active") {
-      await models.AASCommit.update(
-        { status: "Deprecated" },
-        { where: { document_id: { [Op.eq]: document.document_id }, status: { [Op.eq]: "Active" }, commit_id: { [Op.ne]: commit.commit_id } }, transaction: t }
-      );
+    const t = await dbConnection.sequelize.transaction();
+    try {
+      if (status === "Active") {
+        await models.AASCommit.update(
+          { status: "Deprecated" },
+          { where: { document_id: { [Op.eq]: document.document_id }, status: { [Op.eq]: "Active" }, commit_id: { [Op.ne]: commit.commit_id } }, transaction: t }
+        );
+      }
+
+      commit.status = status;
+      await commit.save({ transaction: t });
+      await t.commit();
+
+      return res.status(200).json({
+        status: "Success",
+        message: `Stato aggiornato a '${status}'`,
+        data: { commit_id: commit.commit_id, commit_hash: commit.commit_hash, status: commit.status }
+      });
+    } catch (err) {
+      await t.rollback();
+      throw err;
     }
-
-    commit.status = status;
-    await commit.save({ transaction: t });
-    await t.commit();
-
-    return res.status(200).json({
-      status: "Success",
-      message: `Stato aggiornato a '${status}'`,
-      data: { commit_id: commit.commit_id, commit_hash: commit.commit_hash, status: commit.status }
-    });
   } catch (err) {
-    await t.rollback();
     loggerService.printRequestError(path.basename(__filename), "setCommitStatus", req.user, req.body, err.message);
     return res.status(500).json({ status: "Failure", message: err.message });
   }
@@ -814,44 +832,48 @@ exports.listRefs = async (req, res) => {
  *   commit_id     number   optional   start point; defaults to HEAD
  */
 exports.createBranch = async (req, res) => {
-  const t = await dbConnection.sequelize.transaction();
   try {
     const { organization_id } = req.user;
     const { document_id } = req.params;
     const { branch_name, commit_id } = req.body;
 
     if (!branch_name || branch_name === "HEAD") {
-      await t.rollback();
       return res.status(400).json({ status: "Failure", message: "branch_name è obbligatorio e non può essere 'HEAD'" });
     }
 
     const document = await findDocumentForOrg(document_id, organization_id);
-    if (!document) { await t.rollback(); return res.status(404).json({ status: "Failure", message: "Documento non trovato" }); }
+    if (!document) return res.status(404).json({ status: "Failure", message: "Documento non trovato" });
 
-    // Resolve start point
+    // Resolve start point before opening the transaction.
     let startCommit;
     if (commit_id) {
       startCommit = await models.AASCommit.findOne({ where: { commit_id: { [Op.eq]: commit_id }, document_id: { [Op.eq]: document.document_id } } });
-      if (!startCommit) { await t.rollback(); return res.status(404).json({ status: "Failure", message: "Commit di partenza non trovato" }); }
+      if (!startCommit) return res.status(404).json({ status: "Failure", message: "Commit di partenza non trovato" });
     } else {
       startCommit = await resolveRef(document.document_id, "HEAD");
-      if (!startCommit) { await t.rollback(); return res.status(400).json({ status: "Failure", message: "Il documento non ha ancora commit" }); }
+      if (!startCommit) return res.status(400).json({ status: "Failure", message: "Il documento non ha ancora commit" });
     }
 
-    // Ensure the ref doesn't already exist
-    const existing = await models.AASRef.findOne({ where: { document_id: document.document_id, ref_name: branch_name } });
-    if (existing) { await t.rollback(); return res.status(409).json({ status: "Failure", message: `Il branch '${branch_name}' esiste già` }); }
+    const t = await dbConnection.sequelize.transaction();
+    try {
+      // Existence check inside the transaction so concurrent creations of the same
+      // branch name get a proper 409 instead of an unhandled unique-constraint error.
+      const existing = await models.AASRef.findOne({ where: { document_id: document.document_id, ref_name: branch_name }, transaction: t });
+      if (existing) { await t.rollback(); return res.status(409).json({ status: "Failure", message: `Il branch '${branch_name}' esiste già` }); }
 
-    const ref = await models.AASRef.create({ document_id: document.document_id, ref_name: branch_name, commit_id: startCommit.commit_id }, { transaction: t });
-    await t.commit();
+      const ref = await models.AASRef.create({ document_id: document.document_id, ref_name: branch_name, commit_id: startCommit.commit_id }, { transaction: t });
+      await t.commit();
 
-    return res.status(201).json({
-      status: "Success",
-      message: `Branch '${branch_name}' creato su commit ${startCommit.commit_hash}`,
-      data: { ref: ref.toJSON(), commit: { commit_id: startCommit.commit_id, commit_hash: startCommit.commit_hash } }
-    });
+      return res.status(201).json({
+        status: "Success",
+        message: `Branch '${branch_name}' creato su commit ${startCommit.commit_hash}`,
+        data: { ref: ref.toJSON(), commit: { commit_id: startCommit.commit_id, commit_hash: startCommit.commit_hash } }
+      });
+    } catch (err) {
+      await t.rollback();
+      throw err;
+    }
   } catch (err) {
-    await t.rollback();
     loggerService.printRequestError(path.basename(__filename), "createBranch", req.user, req.body, err.message);
     return res.status(500).json({ status: "Failure", message: err.message });
   }
@@ -866,38 +888,42 @@ exports.createBranch = async (req, res) => {
  *   commit_id   number   optional   if provided, also moves the branch tip
  */
 exports.switchBranch = async (req, res) => {
-  const t = await dbConnection.sequelize.transaction();
   try {
     const { organization_id } = req.user;
     const { document_id, branch_name } = req.params;
     const { commit_id } = req.body;
 
     const document = await findDocumentForOrg(document_id, organization_id);
-    if (!document) { await t.rollback(); return res.status(404).json({ status: "Failure", message: "Documento non trovato" }); }
+    if (!document) return res.status(404).json({ status: "Failure", message: "Documento non trovato" });
 
     const branchRef = await models.AASRef.findOne({ where: { document_id: document.document_id, ref_name: branch_name } });
-    if (!branchRef) { await t.rollback(); return res.status(404).json({ status: "Failure", message: `Branch '${branch_name}' non trovato` }); }
+    if (!branchRef) return res.status(404).json({ status: "Failure", message: `Branch '${branch_name}' non trovato` });
 
-    // If caller also wants to move the branch tip
     if (commit_id) {
       const target = await models.AASCommit.findOne({ where: { commit_id: { [Op.eq]: commit_id }, document_id: { [Op.eq]: document.document_id } } });
-      if (!target) { await t.rollback(); return res.status(404).json({ status: "Failure", message: "Commit non trovato" }); }
-      branchRef.commit_id = commit_id;
-      await branchRef.save({ transaction: t });
+      if (!target) return res.status(404).json({ status: "Failure", message: "Commit non trovato" });
     }
 
-    // Point HEAD to the same commit as the branch
-    await setRef(document.document_id, "HEAD", branchRef.commit_id, t);
+    const t = await dbConnection.sequelize.transaction();
+    try {
+      if (commit_id) {
+        branchRef.commit_id = commit_id;
+        await branchRef.save({ transaction: t });
+      }
 
-    await t.commit();
+      await setRef(document.document_id, "HEAD", branchRef.commit_id, t);
+      await t.commit();
 
-    return res.status(200).json({
-      status: "Success",
-      message: `HEAD spostato su branch '${branch_name}' (commit ${branchRef.commit_id})`,
-      data: { ref_name: branch_name, commit_id: branchRef.commit_id }
-    });
+      return res.status(200).json({
+        status: "Success",
+        message: `HEAD spostato su branch '${branch_name}' (commit ${branchRef.commit_id})`,
+        data: { ref_name: branch_name, commit_id: branchRef.commit_id }
+      });
+    } catch (err) {
+      await t.rollback();
+      throw err;
+    }
   } catch (err) {
-    await t.rollback();
     loggerService.printRequestError(path.basename(__filename), "switchBranch", req.user, req.params, err.message);
     return res.status(500).json({ status: "Failure", message: err.message });
   }
