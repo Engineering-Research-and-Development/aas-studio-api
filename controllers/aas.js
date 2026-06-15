@@ -84,6 +84,18 @@ async function upsertSnapshot(content) {
 }
 
 /**
+ * Load the JSON content of a snapshot by hash. Returns null when the hash is
+ * missing (e.g. the very first commit has no parent snapshot).
+ */
+async function loadSnapshotContent(snapshot_hash, transaction = null) {
+  if (!snapshot_hash) return null;
+  const opts = { where: { hash: snapshot_hash } };
+  if (transaction) opts.transaction = transaction;
+  const snap = await models.AASSnapshot.findOne(opts);
+  return snap ? snap.content : null;
+}
+
+/**
  * Resolve the commit that HEAD (or a named ref) points to for a document.
  * Returns null if the ref doesn't exist yet.
  */
@@ -177,7 +189,11 @@ exports.listDocuments = async (req, res) => {
       documents.map(async (doc) => {
         const headRef = await models.AASRef.findOne({
           where: { document_id: doc.document_id, ref_name: "HEAD" },
-          include: [{ model: models.AASCommit, as: "commit", attributes: ["commit_id", "commit_hash", "version", "revision", "status", "message", "createdAt"] }]
+          include: [{
+            model: models.AASCommit, as: "commit",
+            attributes: ["commit_id", "commit_hash", "version", "revision", "status", "message", "createdAt"],
+            include: [{ model: models.AASCommitDiff, as: "diffs", required: false }]
+          }]
         });
         const allRefs = await models.AASRef.findAll({
           where: { document_id: doc.document_id },
@@ -246,9 +262,15 @@ exports.createDocument = async (req, res) => {
         { transaction: t }
       );
 
-      if (Array.isArray(diffs) && diffs.length > 0) {
+      // Caller-provided diffs win; otherwise derive them from the initial content
+      // (no parent → everything is reported as "added").
+      const effectiveDiffs = Array.isArray(diffs) && diffs.length > 0
+        ? diffs
+        : (content ? computeAasDiffs(null, content) : []);
+
+      if (effectiveDiffs.length > 0) {
         await models.AASCommitDiff.bulkCreate(
-          diffs.map((d, idx) => ({ commit_id: commit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description || null, sort_order: d.sort_order ?? idx })),
+          effectiveDiffs.map((d, idx) => ({ commit_id: commit.commit_id, change_type: d.change_type, target: d.target, name: d.name, description: d.description || null, sort_order: d.sort_order ?? idx })),
           { transaction: t }
         );
       }
@@ -537,9 +559,18 @@ exports.commit = async (req, res) => {
         { transaction: t }
       );
 
-      if (Array.isArray(diffs) && diffs.length > 0) {
+      // Caller-provided diffs win; otherwise derive a semantic changelog by
+      // comparing the parent snapshot with the new content. This is what the
+      // endpoint always promised ("computed from content otherwise").
+      const effectiveDiffs = Array.isArray(diffs) && diffs.length > 0
+        ? diffs
+        : (content
+            ? computeAasDiffs(await loadSnapshotContent(parentCommit ? parentCommit.snapshot_hash : null, t), content)
+            : []);
+
+      if (effectiveDiffs.length > 0) {
         await models.AASCommitDiff.bulkCreate(
-          diffs.map((d, idx) => ({
+          effectiveDiffs.map((d, idx) => ({
             commit_id: newCommit.commit_id,
             change_type: d.change_type, target: d.target, name: d.name,
             description: d.description || null, sort_order: d.sort_order ?? idx,
@@ -668,6 +699,104 @@ function computeJsonDiff(objA, objB, prefix = "") {
   }
 
   return { added, removed, changed };
+}
+
+// ---------------------------------------------------------------------------
+// AAS-aware changelog diff (powers the Lifecycle timeline)
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a submodel element to the `target` label used by the changelog UI.
+ */
+function elementTarget(el) {
+  switch (el && el.type) {
+    case "SubmodelElementCollection": return "Collection";
+    case "MultiLanguageProperty": return "Property";
+    case "Operation": return "Operation";
+    case "File": return "File";
+    case "Blob": return "Blob";
+    case "ReferenceElement": return "ReferenceElement";
+    default: return "Property";
+  }
+}
+
+/**
+ * Stable signature of an element's editable content, used to detect "modified".
+ */
+function elementSignature(el) {
+  if (!el) return "";
+  return JSON.stringify({
+    type: el.type,
+    valueType: el.valueType || null,
+    semanticId: el.semanticId || null,
+    value: el.value === undefined ? null : el.value,
+    contentType: el.contentType || null,
+    children: Array.isArray(el.children)
+      ? el.children.map(c => ({ idShort: c.idShort, type: c.type, valueType: c.valueType || null, semanticId: c.semanticId || null }))
+      : null,
+  });
+}
+
+function indexByIdShort(arr) {
+  const m = new Map();
+  (Array.isArray(arr) ? arr : []).forEach(x => { if (x && x.idShort != null) m.set(x.idShort, x); });
+  return m;
+}
+
+/**
+ * Compute semantic changelog entries between two snapshot contents.
+ * Produces { change_type, target, name, description, sort_order } rows that the
+ * Lifecycle UI renders directly (target = Submodel/Property/Collection/…,
+ * name = "Submodel.Element"). Either side may be null — a null `prevContent`
+ * means the initial commit, so everything is reported as "added".
+ */
+function computeAasDiffs(prevContent, nextContent) {
+  const diffs = [];
+  let order = 0;
+  const push = (change_type, target, name, description) =>
+    diffs.push({ change_type, target, name, description: description || null, sort_order: order++ });
+
+  const prev = prevContent || {};
+  const next = nextContent || {};
+
+  // AAS-level metadata (only when comparing against an existing snapshot)
+  if (prevContent) {
+    if (next.idShort != null && prev.idShort !== next.idShort) push("modified", "AAS", "idShort", "idShort aggiornato");
+    if (next.assetId != null && prev.assetId !== next.assetId) push("modified", "AAS", "globalAssetId", "globalAssetId aggiornato");
+    if (next.description != null && prev.description !== next.description) push("modified", "AAS", "description", "Descrizione aggiornata");
+  }
+
+  const prevSms = indexByIdShort(prev.submodels);
+  const nextSms = indexByIdShort(next.submodels);
+
+  // Added / modified submodels
+  for (const [idShort, sm] of nextSms) {
+    if (!prevSms.has(idShort)) {
+      push("added", "Submodel", idShort, sm.description);
+      for (const el of (sm.elements || [])) push("added", elementTarget(el), `${idShort}.${el.idShort}`, null);
+      continue;
+    }
+    const prevSm = prevSms.get(idShort);
+    if (prevSm.semanticId !== sm.semanticId || prevSm.description !== sm.description || prevSm.id !== sm.id) {
+      push("modified", "Submodel", idShort, "Metadati submodel aggiornati");
+    }
+    const prevEls = indexByIdShort(prevSm.elements);
+    const nextEls = indexByIdShort(sm.elements);
+    for (const [elId, el] of nextEls) {
+      if (!prevEls.has(elId)) push("added", elementTarget(el), `${idShort}.${elId}`, null);
+      else if (elementSignature(prevEls.get(elId)) !== elementSignature(el)) push("modified", elementTarget(el), `${idShort}.${elId}`, null);
+    }
+    for (const [elId, el] of prevEls) {
+      if (!nextEls.has(elId)) push("removed", elementTarget(el), `${idShort}.${elId}`, null);
+    }
+  }
+
+  // Removed submodels
+  for (const [idShort, sm] of prevSms) {
+    if (!nextSms.has(idShort)) push("removed", "Submodel", idShort, sm.description);
+  }
+
+  return diffs;
 }
 
 /**
