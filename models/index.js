@@ -54,7 +54,13 @@ const sequelize = new Sequelize(config.database.mariadb_db, config.database.mari
   },
   define: {
     freezeTableName: true,
-    underscored: true
+    underscored: true,
+    // Pin charset/collation so sync()-created tables match schema/init.sql
+    // (utf8mb4_unicode_ci). Without this, MariaDB 11.4+ creates new tables with
+    // its server default (utf8mb4_uca1400_ai_ci), which then fails to JOIN
+    // against the init.sql tables — error 1267 "Illegal mix of collations".
+    charset: 'utf8mb4',
+    collate: 'utf8mb4_unicode_ci'
   },
   logging: config.stage === 'development' ? console.log : false
 });
